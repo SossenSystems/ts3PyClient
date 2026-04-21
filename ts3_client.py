@@ -64,6 +64,7 @@ ROOT_KEY = bytes([
 ])
 
 CLIENT_VERSION = "3.?.? [Build: 5680278000]"
+INIT_BUILD_TIMESTAMP = 1566914096
 CLIENT_VERSION_SIGNATURES = {
     "Android": "AWb948BY32Z7bpIyoAlQguSmxOGcmjESPceQe1DpW5IZ4+AW1KfTk2VUIYNfUPsxReDJMCtlhVKslzhR2lf0AA==",
     "iOS": "XrAf+Buq6Eb0ehEW/niFp06YX+nGGOS0Ke4MoUBzn+cX9q6G5C0A/d5XtgcNMe8r9jJgV/adIYVpsGS3pVlSAA==",
@@ -800,8 +801,41 @@ class TS3Client:
             print(f"<-- {len(data)} {data[:32].hex()}")
         return data
 
-    def init_packet(self, payload: bytes) -> bytes:
-        return build_header(b"TS3INIT1", 0x65, 0, FLAG_UNENCRYPTED, PTYPE_INIT1) + payload
+    def init_packet(self, payload: bytes, flags: int = 0) -> bytes:
+        return build_header(b"TS3INIT1", 0x65, 0, flags, PTYPE_INIT1) + payload
+
+    def recv_init_packet(self, expected_steps, timeout=8.0, resend_packet=None, resend_interval=0.5):
+        deadline = time.time() + timeout
+        last_send = time.time()
+        expected = set(expected_steps)
+        while time.time() < deadline:
+            if resend_packet is not None and time.time() - last_send >= resend_interval:
+                self.send(resend_packet)
+                last_send = time.time()
+            try:
+                raw = self.recv_raw(timeout=0.1)
+            except socket.timeout:
+                continue
+            if len(raw) < 11:
+                if self.verbose:
+                    print(f"    ignore short init datagram len={len(raw)}")
+                continue
+            try:
+                packet = parse_s2c(raw)
+            except Exception as e:
+                if self.verbose:
+                    print(f"    ignore invalid init datagram: {e}")
+                continue
+            if packet.ptype != PTYPE_INIT1 or not packet.payload:
+                if self.verbose >= 2:
+                    print(f"    ignore non-init packet type={packet.ptype}")
+                continue
+            step = packet.payload[0]
+            if step in expected:
+                return packet
+            if self.verbose:
+                print(f"    ignore unexpected init step={step}")
+        raise socket.timeout("timeout waiting for init packet")
 
     def send_ack(self, packet_id: int):
         payload = struct.pack(">H", packet_id)
@@ -1063,27 +1097,53 @@ class TS3Client:
         return packet, name, args, text
 
     def connect(self):
+        last_error = None
+        init_modes = [
+            ("Modern", INIT_BUILD_TIMESTAMP, 0),
+            ("Modern+NEWPROTOCOL", INIT_BUILD_TIMESTAMP, FLAG_NEWPROTOCOL),
+            ("Legacy", int(time.time()) - 1356998400, FLAG_UNENCRYPTED),
+        ]
+        for mode_name, init_version, init_flags in init_modes:
+            try:
+                return self.connect_with_init_mode(mode_name, init_version, init_flags)
+            except socket.timeout as e:
+                last_error = e
+                if self.verbose:
+                    print(f"    {mode_name} Init timed out")
+            except Exception as e:
+                last_error = e
+                if self.verbose:
+                    print(f"    {mode_name} Init failed: {e}")
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("connect failed")
+
+    def connect_with_init_mode(self, init_mode: str, version: int, init_flags: int):
         timestamp = int(time.time())
-        version = timestamp - 1356998400
         random0 = os.urandom(4)
 
-        print("[1/7] Init Step 0")
-        self.send(self.init_packet(struct.pack(">IBI", version, 0, timestamp) + random0 + b"\x00" * 8))
+        print(f"[1/7] Init Step 0 ({init_mode})")
+        init0_packet = self.init_packet(
+            struct.pack(">IBI", version, 0, timestamp) + random0 + b"\x00" * 8,
+            flags=init_flags,
+        )
+        self.send(init0_packet)
 
-        raw = self.recv_raw()
-        p = parse_s2c(raw)
-        if p.ptype != PTYPE_INIT1 or p.payload[:1] != b"\x01":
-            raise RuntimeError("unexpected init step 1")
+        p = self.recv_init_packet({1}, resend_packet=init0_packet)
         random1 = p.payload[1:17]
         random0_r = p.payload[17:21]
 
         print("[2/7] Init Step 2")
-        self.send(self.init_packet(struct.pack(">IB", version, 2) + random1 + random0_r))
+        init2_packet = self.init_packet(
+            struct.pack(">IB", version, 2) + random1 + random0_r,
+            flags=init_flags,
+        )
+        self.send(init2_packet)
 
-        raw = self.recv_raw()
-        p = parse_s2c(raw)
-        if p.ptype != PTYPE_INIT1 or p.payload[:1] != b"\x03":
-            raise RuntimeError("unexpected init step 3")
+        p = self.recv_init_packet({3, 127}, resend_packet=init2_packet)
+        if p.payload[:1] == b"\x7f":
+            raise RuntimeError("server requested init restart")
         x = p.payload[1:65]
         n = p.payload[65:129]
         level = struct.unpack(">I", p.payload[129:133])[0]
@@ -1101,7 +1161,10 @@ class TS3Client:
             "ot=1 ip"
         ).encode("ascii")
         print("[4/7] Init Step 4")
-        self.send(self.init_packet(struct.pack(">IB", version, 4) + x + n + struct.pack(">I", level) + random2 + y + initiv))
+        self.send(self.init_packet(
+            struct.pack(">IB", version, 4) + x + n + struct.pack(">I", level) + random2 + y + initiv,
+            flags=init_flags,
+        ))
 
         print("[5/7] initivexpand2")
         _, name, args, _ = self.recv_command(allow_fake=True)
