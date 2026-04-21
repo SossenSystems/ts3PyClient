@@ -13,8 +13,11 @@ import argparse
 import base64
 import hashlib
 import os
+import platform
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -25,7 +28,18 @@ from Crypto.PublicKey import ECC
 from Crypto.Signature import DSS
 
 
+OPUS_SAMPLE_RATE = 48000
+OPUS_CHANNELS = 1
+OPUS_MAX_FRAME_SIZE = 2880
+OPUS_MUSIC_FRAME_SIZE = 960
+OPUS_MUSIC_FRAME_BYTES = OPUS_MUSIC_FRAME_SIZE * OPUS_CHANNELS * 2
+
+CODEC_OPUS_VOICE = 4
+CODEC_OPUS_MUSIC = 5
+
 PTYPE_COMMAND = 2
+PTYPE_VOICE = 0
+PTYPE_VOICE_WHISPER = 1
 PTYPE_PING = 4
 PTYPE_PONG = 5
 PTYPE_ACK = 6
@@ -47,10 +61,13 @@ ROOT_KEY = bytes([
 ])
 
 CLIENT_VERSION = "3.?.? [Build: 5680278000]"
-CLIENT_PLATFORM = "Windows"
-CLIENT_VERSION_SIGN = (
-    "DX5NIYLvfJEUjuIbCidnoeozxIDRRkpq3I9vVMBmE9L2qnekOoBzSenkzsg2lC9CMv8K5hkEzhr2TYUYSwUXCg=="
-)
+CLIENT_VERSION_SIGNATURES = {
+    "Android": "AWb948BY32Z7bpIyoAlQguSmxOGcmjESPceQe1DpW5IZ4+AW1KfTk2VUIYNfUPsxReDJMCtlhVKslzhR2lf0AA==",
+    "iOS": "XrAf+Buq6Eb0ehEW/niFp06YX+nGGOS0Ke4MoUBzn+cX9q6G5C0A/d5XtgcNMe8r9jJgV/adIYVpsGS3pVlSAA==",
+    "Linux": "Hjd+N58Gv3ENhoKmGYy2bNRBsNNgm5kpiaQWxOj5HN2DXttG6REjymSwJtpJ8muC2gSwRuZi0R+8Laan5ts5CQ==",
+    "OS X": "SttEnjoWE8jqIM6BOHSfiZP9DGjW0EP/ajU4bdKqgGMV4aYq/kzwVA9gxbmdIzV4lbaokvXBqrRjfBHrTVh8Cg==",
+    "Windows": "DX5NIYLvfJEUjuIbCidnoeozxIDRRkpq3I9vVMBmE9L2qnekOoBzSenkzsg2lC9CMv8K5hkEzhr2TYUYSwUXCg==",
+}
 HWID = "923f136fb1e22ae6ce95e60255529c00,d13231b1bc33edfecfb9169cc7a63bcc"
 DEFAULT_IDENTITY_TS = (
     "MG0DAgeAAgEgAiAIXJBlj1hQbaH0Eq0DuLlCmH8bl+veTAO2+"
@@ -397,6 +414,85 @@ def make_command(name: str, args: list[tuple[str, str]]) -> bytes:
     return " ".join(parts).encode("utf-8")
 
 
+def pitch_shift_pcm16_mono(pcm: bytes, factor: float) -> bytes:
+    factor = max(0.25, min(4.0, factor))
+    if abs(factor - 1.0) < 0.001 or len(pcm) < 4:
+        return pcm
+
+    count = len(pcm) // 2
+    samples = struct.unpack("<" + "h" * count, pcm[:count * 2])
+    shifted = []
+    last = count - 1
+    for i in range(count):
+        pos = i * factor
+        if pos >= last:
+            shifted.append(0)
+            continue
+        base = int(pos)
+        frac = pos - base
+        value = samples[base] * (1.0 - frac) + samples[base + 1] * frac
+        shifted.append(max(-32768, min(32767, int(value))))
+    return struct.pack("<" + "h" * count, *shifted)
+
+
+def scale_pcm16_mono(pcm: bytes, volume: float) -> bytes:
+    volume = max(0.0, min(4.0, volume))
+    if abs(volume - 1.0) < 0.001 or len(pcm) < 2:
+        return pcm
+
+    count = len(pcm) // 2
+    samples = struct.unpack("<" + "h" * count, pcm[:count * 2])
+    scaled = [max(-32768, min(32767, int(sample * volume))) for sample in samples]
+    return struct.pack("<" + "h" * count, *scaled)
+
+
+def resolve_play_link(link: str) -> str:
+    if link.startswith(("http://", "https://")) and not looks_like_direct_media_url(link):
+        downloader = shutil.which("yt-dlp") or shutil.which("youtube-dl")
+        if downloader:
+            try:
+                out = subprocess.check_output(
+                    [downloader, "-f", "bestaudio/best", "-g", link],
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=20,
+                )
+                urls = [line.strip() for line in out.splitlines() if line.strip()]
+                if urls:
+                    return urls[0]
+            except Exception:
+                return link
+    return link
+
+
+def looks_like_direct_media_url(link: str) -> bool:
+    path = link.split("?", 1)[0].lower()
+    return path.endswith((".mp3", ".ogg", ".opus", ".wav", ".flac", ".m4a", ".aac", ".webm", ".mp4"))
+
+
+def detect_client_platform() -> str:
+    system = platform.system()
+    machine = platform.machine().lower()
+    platform_text = platform.platform().lower()
+
+    if system == "Darwin":
+        if "iphone" in machine or "ipad" in machine or "ios" in platform_text:
+            return "iOS"
+        return "OS X"
+    if system == "Windows":
+        return "Windows"
+    if system == "Linux":
+        if "android" in platform_text or "ANDROID_ROOT" in os.environ:
+            return "Android"
+        return "Linux"
+    return "Windows"
+
+
+def detect_client_version_info() -> tuple[str, str, str]:
+    client_platform = detect_client_platform()
+    return CLIENT_VERSION, client_platform, CLIENT_VERSION_SIGNATURES[client_platform]
+
+
 def hashcash_level(omega: str, offset: int) -> int:
     digest = hashlib.sha1(f"{omega}{offset}".encode("ascii")).digest()
     level = 0
@@ -555,23 +651,67 @@ def derive_server_ephemeral_key(license_data: bytes, root_key: bytes = ROOT_KEY)
 
 
 class TS3Client:
-    def __init__(self, host, port, nickname, password="", verbose=0):
+    def __init__(
+        self,
+        host,
+        port,
+        nickname,
+        password="",
+        verbose=0,
+        echo_test=False,
+        echo_pitch=1.0,
+        volume=1.0,
+        play_link=None,
+    ):
         self.host = host
         self.port = port
         self.nickname = nickname
         self.password = password
         self.verbose = verbose
+        self.echo_test = echo_test
+        self.echo_pitch = echo_pitch
+        self.volume = max(0.0, min(4.0, volume))
+        self.play_link = play_link
+        self.opus_decoder = None
+        self.opus_encoder = None
+        self.opuslib = None
+        self.current_channel_id = None
+        self.channels = {}
+        self.output_codec = CODEC_OPUS_VOICE
+        self.output_codec_name = "OpusVoice"
+        if self.play_link and not shutil.which("ffmpeg"):
+            raise RuntimeError("--play-link braucht ffmpeg im PATH")
+        if self.echo_test and (abs(self.echo_pitch - 1.0) > 0.001 or abs(self.volume - 1.0) > 0.001) or self.play_link:
+            try:
+                import opuslib
+            except ImportError as e:
+                raise RuntimeError(
+                    "Audio-Features mit Pitch oder --play-link brauchen opuslib. Installiere es z.B. in einer venv mit: "
+                    "python3 -m pip install opuslib"
+                ) from e
+            self.opuslib = opuslib
+            if self.echo_test and (abs(self.echo_pitch - 1.0) > 0.001 or abs(self.volume - 1.0) > 0.001):
+                self.opus_decoder = opuslib.Decoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS)
+            self.configure_opus_encoder(CODEC_OPUS_VOICE)
         self.sock = socket.socket(socket.AF_INET6 if ":" in socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)[0][4][0] else socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(10)
         self.addr = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)[0][4]
         self.client_id = 0
+        self.voice_packet_id = 1
+        self.voice_id = 1
         self.command_id = 0
+        self.ack_id = 1
+        self.ping_id = 1
+        self.pong_id = 1
         self.iv = None
         self.shared_mac = None
         self.identity = create_identity()
         self.identity_tomcrypt_pub = p256_public_tomcrypt(self.identity)
         self._fragment_payload = None
         self._fragment_flags = 0
+        self.connected = False
+        self.last_receive = time.time()
+        self.last_ping_sent = 0.0
 
     def send(self, data: bytes):
         if self.verbose >= 3:
@@ -581,6 +721,7 @@ class TS3Client:
     def recv_raw(self, timeout=10):
         self.sock.settimeout(timeout)
         data, _ = self.sock.recvfrom(65535)
+        self.last_receive = time.time()
         if self.verbose >= 3:
             print(f"<-- {len(data)} {data[:32].hex()}")
         return data
@@ -593,13 +734,124 @@ class TS3Client:
         if self.iv is None:
             self.send(encrypt_fake_c2s(payload, packet_id, self.client_id, PTYPE_ACK))
         else:
-            self.send(encrypt_shared(payload, packet_id, self.client_id, PTYPE_ACK, self.iv))
+            ack_id = self.ack_id
+            self.ack_id = (self.ack_id + 1) & 0xFFFF
+            self.send(encrypt_shared(payload, ack_id, self.client_id, PTYPE_ACK, self.iv))
+
+    def send_pong(self, packet_id: int):
+        pong_id = self.pong_id
+        self.pong_id = (self.pong_id + 1) & 0xFFFF
+        payload = struct.pack(">H", packet_id)
+        self.send(build_header(self.shared_mac or b"\x00" * 8, pong_id, self.client_id, FLAG_UNENCRYPTED, PTYPE_PONG) + payload)
+        if self.verbose >= 2:
+            print(f"[PONG] sent id={pong_id} ack={packet_id}")
+
+    def send_ping(self):
+        ping_id = self.ping_id
+        self.ping_id = (self.ping_id + 1) & 0xFFFF
+        self.last_ping_sent = time.time()
+        self.send(build_header(self.shared_mac or b"\x00" * 8, ping_id, self.client_id, FLAG_UNENCRYPTED, PTYPE_PING))
+        if self.verbose >= 2:
+            print(f"[PING] sent id={ping_id}")
+
+    def configure_opus_encoder(self, codec: int):
+        if self.opuslib is None:
+            return
+        if codec == CODEC_OPUS_MUSIC:
+            encoder = self.opuslib.Encoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS, self.opuslib.APPLICATION_AUDIO)
+            self.set_opus_option(encoder, "vbr", 1)
+            self.set_opus_option(encoder, "vbr_constraint", 0)
+            self.set_opus_option(encoder, "complexity", 10)
+            self.output_codec = CODEC_OPUS_MUSIC
+            self.output_codec_name = "OpusMusic"
+        else:
+            encoder = self.opuslib.Encoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS, self.opuslib.APPLICATION_VOIP)
+            self.set_opus_option(encoder, "vbr", 1)
+            self.set_opus_option(encoder, "complexity", 10)
+            self.output_codec = CODEC_OPUS_VOICE
+            self.output_codec_name = "OpusVoice"
+        self.opus_encoder = encoder
+        if self.verbose:
+            print(f"[*] Audio-Profil: {self.output_codec_name}")
+
+    def set_opus_option(self, encoder, name: str, value):
+        try:
+            setattr(encoder, name, value)
+        except Exception as e:
+            if self.verbose >= 2:
+                print(f"[OPUS] Option {name}={value} nicht gesetzt: {e}")
+
+    def update_output_codec_from_channel(self):
+        if self.current_channel_id is None:
+            return
+        codec = self.channels.get(str(self.current_channel_id))
+        if codec is None:
+            return
+        desired = CODEC_OPUS_MUSIC if codec == CODEC_OPUS_MUSIC else CODEC_OPUS_VOICE
+        if desired != self.output_codec:
+            self.configure_opus_encoder(desired)
+
+    def send_voice_echo(self, codec: int, audio: bytes, encrypted=True):
+        if self.opus_decoder is not None and self.opus_encoder is not None:
+            audio = self.pitch_shift_opus(audio)
+        self.send_voice_payload(codec, audio, encrypted=encrypted, label="ECHO")
+
+    def send_voice_payload(self, codec: int, audio: bytes, encrypted=True, label="VOICEOUT"):
+        packet_id = self.voice_packet_id
+        voice_id = self.voice_id
+        self.voice_packet_id = (self.voice_packet_id + 1) & 0xFFFF
+        self.voice_id = (self.voice_id + 1) & 0xFFFF
+        payload = struct.pack(">HB", voice_id, codec) + audio
+        if encrypted:
+            packet = encrypt_shared(payload, packet_id, self.client_id, PTYPE_VOICE, self.iv)
+        else:
+            packet = build_header(self.shared_mac or b"\x00" * 8, packet_id, self.client_id, FLAG_UNENCRYPTED, PTYPE_VOICE) + payload
+        self.send(packet)
+        if self.verbose >= 2:
+            mode = "encrypted" if encrypted else "plain"
+            print(f"[{label}] voice_id={voice_id} codec={codec} bytes={len(audio)} {mode}")
+
+    def pitch_shift_opus(self, audio: bytes) -> bytes:
+        try:
+            pcm = self.opus_decoder.decode(audio, OPUS_MAX_FRAME_SIZE, False)
+            frame_size = len(pcm) // 2
+            if frame_size <= 0:
+                return audio
+            shifted = pitch_shift_pcm16_mono(pcm, self.echo_pitch)
+            adjusted = scale_pcm16_mono(shifted, self.volume)
+            return self.opus_encoder.encode(adjusted, frame_size)
+        except Exception as e:
+            if self.verbose >= 2:
+                print(f"[PITCH] failed, using original frame: {e}")
+            return audio
+
+    def handle_voice_packet(self, raw: bytes, packet: Packet):
+        encrypted = not bool(packet.flags & FLAG_UNENCRYPTED)
+        payload = decrypt_shared(packet, raw, self.iv) if encrypted else packet.payload
+        if len(payload) < 5:
+            return
+        voice_id = struct.unpack(">H", payload[:2])[0]
+        from_client_id = struct.unpack(">H", payload[2:4])[0]
+        codec = payload[4]
+        audio = payload[5:]
+        if self.verbose >= 2:
+            mode = "encrypted" if encrypted else "plain"
+            print(f"[VOICE] from={from_client_id} voice_id={voice_id} codec={codec} bytes={len(audio)} {mode}")
+        if self.echo_test and from_client_id != self.client_id and audio:
+            self.send_voice_echo(codec, audio, encrypted=encrypted)
+
+    def keepalive(self):
+        if not self.connected:
+            return
+        now = time.time()
+        if now - max(self.last_receive, self.last_ping_sent) >= 25:
+            self.send_ping()
 
     def send_command(self, payload: bytes, packet_id=None):
         if packet_id is None:
             packet_id = self.command_id
             self.command_id += 1
-        self.send(encrypt_shared(payload, packet_id, self.client_id, PTYPE_COMMAND, self.iv))
+        self.send(encrypt_shared(payload, packet_id, self.client_id, PTYPE_COMMAND, self.iv, FLAG_NEWPROTOCOL))
         return packet_id
 
     def command_packet(self, payload: bytes, packet_id: int):
@@ -634,7 +886,13 @@ class TS3Client:
             if packet.ptype == PTYPE_ACK:
                 continue
             if packet.ptype == PTYPE_PING:
-                self.send(build_header(b"\x00" * 8, packet.packet_id, self.client_id, FLAG_UNENCRYPTED, PTYPE_PONG) + struct.pack(">H", packet.packet_id))
+                self.send_pong(packet.packet_id)
+                continue
+            if packet.ptype == PTYPE_PONG:
+                continue
+            if packet.ptype in (PTYPE_VOICE, PTYPE_VOICE_WHISPER):
+                if self.echo_test:
+                    self.handle_voice_packet(raw, packet)
                 continue
             if packet.ptype != PTYPE_COMMAND:
                 continue
@@ -642,6 +900,66 @@ class TS3Client:
             if result is None:
                 continue
             return result
+
+    def handle_event(self, name: str, args: dict[str, str], text: str):
+        if name == "channellist":
+            self.update_channels_from_text(text)
+            self.update_output_codec_from_channel()
+            return
+
+        if name == "notifycliententerview":
+            self.update_current_channel_from_text(text)
+            self.update_output_codec_from_channel()
+
+        if name == "notifyclientmoved" and args.get("clid") == str(self.client_id):
+            channel_id = args.get("ctid")
+            if channel_id:
+                self.current_channel_id = channel_id
+                self.update_output_codec_from_channel()
+
+        if name == "notifychanneledited":
+            channel_id = args.get("cid")
+            codec = args.get("channel_codec")
+            if channel_id and codec is not None:
+                self.channels[channel_id] = int(codec)
+                self.update_output_codec_from_channel()
+
+        if name == "notifytextmessage":
+            sender = args.get("invokername") or args.get("fromname") or args.get("invokerid") or "Unbekannt"
+            message = args.get("msg") or args.get("message") or ""
+            target_mode = args.get("targetmode", "?")
+            modes = {
+                "1": "privat",
+                "2": "channel",
+                "3": "server",
+            }
+            scope = modes.get(target_mode, f"mode {target_mode}")
+            print(f"[MSG:{scope}] {sender}: {message}")
+            return
+
+        if name.startswith("notify") and self.verbose:
+            print(f"[EVENT] {text}")
+
+    def update_channels_from_text(self, text: str):
+        for i, item in enumerate(text.split("|")):
+            item_text = item if i == 0 else f"item {item}"
+            _, args, _ = parse_command_args(item_text.encode("utf-8"))
+            channel_id = args.get("cid")
+            codec = args.get("channel_codec")
+            if channel_id and codec is not None:
+                self.channels[channel_id] = int(codec)
+        if self.current_channel_id is None and len(self.channels) == 1:
+            self.current_channel_id = next(iter(self.channels))
+
+    def update_current_channel_from_text(self, text: str):
+        for i, item in enumerate(text.split("|")):
+            item_text = item if i == 0 else f"item {item}"
+            _, args, _ = parse_command_args(item_text.encode("utf-8"))
+            if args.get("clid") == str(self.client_id):
+                channel_id = args.get("ctid")
+                if channel_id:
+                    self.current_channel_id = channel_id
+                    return
 
     def decode_command_packet(self, raw: bytes, packet: Packet, allow_fake=False):
         payload = decrypt_fake(packet, raw) if allow_fake else decrypt_shared(packet, raw, self.iv)
@@ -765,17 +1083,20 @@ class TS3Client:
 
         omega_ts = base64.b64encode(self.identity_tomcrypt_pub).decode("ascii")
         offset = solve_hashcash(omega_ts, 8)
+        client_version, client_platform, client_version_sign = detect_client_version_info()
+        if self.verbose:
+            print(f"    client platform={client_platform} version={client_version}")
         clientinit = make_command("clientinit", [
             ("client_nickname", self.nickname),
-            ("client_version", CLIENT_VERSION),
-            ("client_platform", CLIENT_PLATFORM),
+            ("client_version", client_version),
+            ("client_platform", client_platform),
             ("client_input_hardware", "1"),
             ("client_output_hardware", "1"),
             ("client_default_channel", ""),
             ("client_default_channel_password", ""),
             ("client_server_password", self.password),
             ("client_meta_data", ""),
-            ("client_version_sign", CLIENT_VERSION_SIGN),
+            ("client_version_sign", client_version_sign),
             ("client_nickname_phonetic", ""),
             ("client_key_offset", str(offset)),
             ("client_default_token", ""),
@@ -794,25 +1115,121 @@ class TS3Client:
             if name == "initserver":
                 if "aclid" in args:
                     self.client_id = int(args["aclid"])
+                self.command_id = max(self.command_id, 3)
+                self.connected = True
                 print("[+] Connected")
                 return True
             if name == "error":
                 raise RuntimeError(text)
         raise RuntimeError("timeout waiting for initserver")
 
-    def listen(self):
+    def listen(self, until=None):
         print("[*] Verbunden. Ctrl+C zum Trennen.")
         while True:
-            self.recv_command(timeout=30)
+            if until is not None and time.time() >= until:
+                return
+            self.keepalive()
+            timeout = 1.0 if until is None else max(0.1, min(1.0, until - time.time()))
+            try:
+                _, name, args, text = self.recv_command(timeout=timeout)
+            except socket.timeout:
+                continue
+            self.handle_event(name, args, text)
+
+    def pump_network_once(self, timeout=0.0):
+        self.keepalive()
+        try:
+            _, name, args, text = self.recv_command(timeout=timeout)
+        except (socket.timeout, BlockingIOError):
+            return
+        self.handle_event(name, args, text)
+
+    def play_link_audio(self, link: str):
+        if self.opus_encoder is None:
+            raise RuntimeError("--play-link braucht opuslib")
+        self.drain_initial_audio_state()
+        source = resolve_play_link(link)
+        cmd = [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            source,
+            "-vn",
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            str(OPUS_CHANNELS),
+            "-ar",
+            str(OPUS_SAMPLE_RATE),
+            "-",
+        ]
+        print(f"[*] Spiele Link: {link}")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        next_frame = time.monotonic()
+        try:
+            while True:
+                chunk = proc.stdout.read(OPUS_MUSIC_FRAME_BYTES)
+                if not chunk:
+                    break
+                while len(chunk) < OPUS_MUSIC_FRAME_BYTES:
+                    more = proc.stdout.read(OPUS_MUSIC_FRAME_BYTES - len(chunk))
+                    if not more:
+                        break
+                    chunk += more
+                if len(chunk) < OPUS_MUSIC_FRAME_BYTES:
+                    chunk += b"\x00" * (OPUS_MUSIC_FRAME_BYTES - len(chunk))
+                chunk = scale_pcm16_mono(chunk, self.volume)
+                encoded = self.opus_encoder.encode(chunk, OPUS_MUSIC_FRAME_SIZE)
+                self.send_voice_payload(self.output_codec, encoded, encrypted=False, label="MUSIC")
+                self.pump_network_once(timeout=0.0)
+                next_frame += OPUS_MUSIC_FRAME_SIZE / OPUS_SAMPLE_RATE
+                delay = next_frame - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+            stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
+            rc = proc.wait(timeout=2)
+            if rc != 0:
+                raise RuntimeError(f"ffmpeg konnte den Link nicht abspielen: {stderr or 'exit ' + str(rc)}")
+        print("[*] Wiedergabe beendet.")
+
+    def drain_initial_audio_state(self):
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if self.current_channel_id is not None and str(self.current_channel_id) in self.channels:
+                self.update_output_codec_from_channel()
+                return
+            self.pump_network_once(timeout=0.2)
+        self.update_output_codec_from_channel()
 
     def disconnect(self):
         try:
-            if self.iv is not None:
+            if self.iv is not None and self.connected:
                 cmd = make_command("clientdisconnect", [
                     ("reasonid", "8"),
-                    ("reasonmsg", "Auf Wiedersehen"),
+                    ("reasonmsg", "Python Client say's good bye!"),
                 ])
                 self.send_command(cmd)
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    try:
+                        _, name, args, text = self.recv_command(timeout=0.5)
+                    except socket.timeout:
+                        continue
+
+                    if name == "notifyclientleftview" and args.get("clid") == str(self.client_id):
+                        if self.verbose:
+                            print(f"[DISCONNECT] {text}")
+                        self.connected = False
+                        break
+                    self.handle_event(name, args, text)
         except Exception:
             pass
         self.sock.close()
@@ -825,6 +1242,20 @@ def main():
     parser.add_argument("-n", "--nickname", default="PythonClient")
     parser.add_argument("--password", default="")
     parser.add_argument("--stay-seconds", type=int, default=0)
+    parser.add_argument("--play-link", default="", help="Audio-Link oder Datei als Musikbot abspielen")
+    parser.add_argument("--echo-test", action="store_true", help="Eingehende Voice-Pakete 1:1 zuruecksenden")
+    parser.add_argument(
+        "--echo-pitch",
+        type=float,
+        default=1.0,
+        help="Pitch-Faktor fuer --echo-test: 1.0 normal, >1 hoeher, <1 tiefer",
+    )
+    parser.add_argument(
+        "--volume",
+        type=float,
+        default=1.0,
+        help="Ausgabe-Lautstaerke: 1.0 normal, 0.5 leiser, 2.0 lauter",
+    )
     parser.add_argument("-v", "--verbose", action="count", default=0)
     args = parser.parse_args()
 
@@ -833,21 +1264,37 @@ def main():
     print(f"  Nickname: {args.nickname}")
     print("=" * 60)
 
-    client = TS3Client(args.host, args.port, args.nickname, args.password, args.verbose)
+    client = None
     try:
+        client = TS3Client(
+            args.host,
+            args.port,
+            args.nickname,
+            args.password,
+            args.verbose,
+            args.echo_test,
+            args.echo_pitch,
+            args.volume,
+            args.play_link or None,
+        )
         client.connect()
-        if args.stay_seconds:
-            time.sleep(args.stay_seconds)
+        if args.play_link:
+            client.play_link_audio(args.play_link)
+            if args.stay_seconds:
+                client.listen(until=time.time() + args.stay_seconds)
+        elif args.stay_seconds:
+            client.listen(until=time.time() + args.stay_seconds)
         else:
             client.listen()
     except KeyboardInterrupt:
-        print("\n[*] Unterbrochen.")
+        print("\n[*] Unterbrochen, sende Disconnect.")
     except Exception as e:
         print(f"[-] {e}")
         return 1
     finally:
-        client.disconnect()
-        print("[*] Getrennt.")
+        if client is not None:
+            client.disconnect()
+            print("[*] Getrennt.")
     return 0
 
 
