@@ -12,6 +12,7 @@ Kein Audio.
 import argparse
 import base64
 import hashlib
+import json
 import os
 import platform
 import shutil
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from Crypto.Cipher import AES
 from Crypto.Hash import SHA256
@@ -68,7 +70,7 @@ CLIENT_VERSION_SIGNATURES = {
     "OS X": "SttEnjoWE8jqIM6BOHSfiZP9DGjW0EP/ajU4bdKqgGMV4aYq/kzwVA9gxbmdIzV4lbaokvXBqrRjfBHrTVh8Cg==",
     "Windows": "DX5NIYLvfJEUjuIbCidnoeozxIDRRkpq3I9vVMBmE9L2qnekOoBzSenkzsg2lC9CMv8K5hkEzhr2TYUYSwUXCg==",
 }
-HWID = "923f136fb1e22ae6ce95e60255529c00,d13231b1bc33edfecfb9169cc7a63bcc"
+DEFAULT_CONFIG_PATH = Path("ts3_client_config.json")
 DEFAULT_IDENTITY_TS = (
     "MG0DAgeAAgEgAiAIXJBlj1hQbaH0Eq0DuLlCmH8bl+veTAO2+"
     "k9EQjEYSgIgNnImcmKo7ls5mExb6skfK2Tw+u54aeDr0OP1ITs"
@@ -577,12 +579,71 @@ def p256_public_tomcrypt(key: ECC.EccKey) -> bytes:
     ])
 
 
+def p256_private_tomcrypt(key: ECC.EccKey) -> bytes:
+    pub = key.public_key()
+    return der_sequence([
+        der_bit_string(b"\x00", 7),
+        der_int(32),
+        der_int(int(pub.pointQ.x)),
+        der_int(int(pub.pointQ.y)),
+        der_int(int(key.d)),
+    ])
+
+
 def create_identity() -> ECC.EccKey:
     while True:
         key = ECC.generate(curve="P-256")
         pub = key.public_key()
         if int(pub.pointQ.x).bit_length() > 248 and int(pub.pointQ.y).bit_length() > 248:
             return key
+
+
+def generate_hwid() -> str:
+    return f"{os.urandom(16).hex()},{os.urandom(16).hex()}"
+
+
+def create_default_config() -> dict:
+    identity = create_identity()
+    return {
+        "identity": base64.b64encode(p256_private_tomcrypt(identity)).decode("ascii"),
+        "hwid": generate_hwid(),
+        "default_channel": "",
+        "default_channel_password": "",
+    }
+
+
+def load_or_create_config(path: Path) -> dict:
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            config = json.load(f)
+    else:
+        config = create_default_config()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+            f.write("\n")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        print(f"[*] Neue Config erstellt: {path}")
+
+    changed = False
+    for key, value in {
+        "identity": None,
+        "hwid": None,
+        "default_channel": "",
+        "default_channel_password": "",
+    }.items():
+        if key not in config:
+            config[key] = create_default_config()[key] if value is None else value
+            changed = True
+
+    if changed:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+            f.write("\n")
+    return config
 
 
 def parse_tomcrypt_private(data: bytes) -> ECC.EccKey:
@@ -662,6 +723,9 @@ class TS3Client:
         echo_pitch=1.0,
         volume=1.0,
         play_link=None,
+        config=None,
+        default_channel=None,
+        default_channel_password=None,
     ):
         self.host = host
         self.port = port
@@ -672,6 +736,14 @@ class TS3Client:
         self.echo_pitch = echo_pitch
         self.volume = max(0.0, min(4.0, volume))
         self.play_link = play_link
+        self.config = config or create_default_config()
+        self.hwid = self.config.get("hwid") or generate_hwid()
+        self.default_channel = self.config.get("default_channel", "") if default_channel is None else default_channel
+        self.default_channel_password = (
+            self.config.get("default_channel_password", "")
+            if default_channel_password is None
+            else default_channel_password
+        )
         self.opus_decoder = None
         self.opus_encoder = None
         self.opuslib = None
@@ -705,7 +777,7 @@ class TS3Client:
         self.pong_id = 1
         self.iv = None
         self.shared_mac = None
-        self.identity = create_identity()
+        self.identity = parse_tomcrypt_private(base64.b64decode(self.config["identity"]))
         self.identity_tomcrypt_pub = p256_public_tomcrypt(self.identity)
         self._fragment_payload = None
         self._fragment_flags = 0
@@ -1092,10 +1164,10 @@ class TS3Client:
             ("client_platform", client_platform),
             ("client_input_hardware", "1"),
             ("client_output_hardware", "1"),
-            ("client_default_channel", ""),
-            ("client_default_channel_password", ""),
+            ("client_default_channel", self.default_channel),
+            ("client_default_channel_password", self.default_channel_password),
             ("client_server_password", self.password),
-            ("client_meta_data", ""),
+            ("client_meta_data", f"hwid={self.hwid}"),
             ("client_version_sign", client_version_sign),
             ("client_nickname_phonetic", ""),
             ("client_key_offset", str(offset)),
@@ -1241,6 +1313,9 @@ def main():
     parser.add_argument("-p", "--port", type=int, default=9987)
     parser.add_argument("-n", "--nickname", default="PythonClient")
     parser.add_argument("--password", default="")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Pfad zur Client-Config")
+    parser.add_argument("--default-channel", default=None, help="Default-Channel fuer diesen Start")
+    parser.add_argument("--default-channel-password", default=None, help="Passwort fuer den Default-Channel")
     parser.add_argument("--stay-seconds", type=int, default=0)
     parser.add_argument("--play-link", default="", help="Audio-Link oder Datei als Musikbot abspielen")
     parser.add_argument("--echo-test", action="store_true", help="Eingehende Voice-Pakete 1:1 zuruecksenden")
@@ -1266,6 +1341,8 @@ def main():
 
     client = None
     try:
+        config_path = Path(args.config)
+        config = load_or_create_config(config_path)
         client = TS3Client(
             args.host,
             args.port,
@@ -1276,6 +1353,9 @@ def main():
             args.echo_pitch,
             args.volume,
             args.play_link or None,
+            config,
+            args.default_channel,
+            args.default_channel_password,
         )
         client.connect()
         if args.play_link:

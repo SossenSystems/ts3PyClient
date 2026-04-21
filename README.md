@@ -60,6 +60,48 @@ Wenn du stattdessen `python3 ts3_client.py ...` nutzt und Fehler wie
 `ModuleNotFoundError: No module named 'Crypto'` bekommst, verwendest du nicht die
 venv oder die Dependencies sind in dieser Python-Umgebung nicht installiert.
 
+## Config
+
+Beim ersten Start erstellt der Client automatisch eine Config-Datei:
+
+```text
+ts3_client_config.json
+```
+
+Darin werden gespeichert:
+
+- TeamSpeak-Identität
+- HWID
+- Default-Channel
+- Default-Channel-Passwort
+
+Beispiel:
+
+```json
+{
+  "identity": "...",
+  "hwid": "00112233445566778899aabbccddeeff,00112233445566778899aabbccddeeff",
+  "default_channel": "",
+  "default_channel_password": ""
+}
+```
+
+Wenn `default_channel` leer ist, verbindet sich der Client in den Default-Channel
+des Servers. Wenn ein Channel-Passwort gebraucht wird, kann es in
+`default_channel_password` eingetragen werden.
+
+Eine andere Config-Datei kann per CLI gesetzt werden:
+
+```bash
+.venv/bin/python -u ts3_client.py localhost -n PythonClient --config ./bot_config.json
+```
+
+Default-Channel und Channel-Passwort können für einen Start überschrieben werden:
+
+```bash
+.venv/bin/python -u ts3_client.py localhost -n PythonClient --default-channel "Musik" --default-channel-password "secret"
+```
+
 ## Lokalen Testserver Starten
 
 Im Repository liegt ein lokaler TS3-Server unter `server/`.
@@ -249,9 +291,11 @@ Wenn `yt-dlp` nicht installiert ist, versucht der Client den Link direkt an
 
 ```text
 usage: ts3_client.py [-h] [-p PORT] [-n NICKNAME] [--password PASSWORD]
+                     [--config CONFIG] [--default-channel DEFAULT_CHANNEL]
+                     [--default-channel-password DEFAULT_CHANNEL_PASSWORD]
                      [--stay-seconds STAY_SECONDS] [--play-link PLAY_LINK]
-                     [--echo-test] [--echo-pitch ECHO_PITCH] [--volume VOLUME]
-                     [-v]
+                     [--echo-test] [--echo-pitch ECHO_PITCH]
+                     [--volume VOLUME] [-v]
                      [host]
 ```
 
@@ -261,6 +305,9 @@ Optionen:
 - `-p`, `--port`: UDP-Port, Standard `9987`
 - `-n`, `--nickname`: Nickname des Clients
 - `--password`: Serverpasswort
+- `--config`: Pfad zur Config-Datei, Standard `ts3_client_config.json`
+- `--default-channel`: Default-Channel für diesen Start überschreiben
+- `--default-channel-password`: Default-Channel-Passwort für diesen Start überschreiben
 - `--stay-seconds`: nach Connect oder Wiedergabe nur diese Sekunden laufen
 - `--play-link`: Datei oder Link als Musikbot abspielen
 - `--echo-test`: eingehende Voice-Pakete zurückspielen
