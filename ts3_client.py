@@ -16,6 +16,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -736,6 +737,7 @@ class TS3Client:
         self.echo_pitch = echo_pitch
         self.volume = max(0.0, min(4.0, volume))
         self.play_link = play_link
+        self.play_process = None
         self.config = config or create_default_config()
         self.hwid = self.config.get("hwid") or generate_hwid()
         self.default_channel = self.config.get("default_channel", "") if default_channel is None else default_channel
@@ -806,9 +808,7 @@ class TS3Client:
         if self.iv is None:
             self.send(encrypt_fake_c2s(payload, packet_id, self.client_id, PTYPE_ACK))
         else:
-            ack_id = self.ack_id
-            self.ack_id = (self.ack_id + 1) & 0xFFFF
-            self.send(encrypt_shared(payload, ack_id, self.client_id, PTYPE_ACK, self.iv))
+            self.send(encrypt_shared(payload, packet_id, self.client_id, PTYPE_ACK, self.iv))
 
     def send_pong(self, packet_id: int):
         pong_id = self.pong_id
@@ -1177,6 +1177,7 @@ class TS3Client:
         clientinit_packets = self.command_packets(clientinit, 2)
         for packet in clientinit_packets:
             self.send(packet)
+        next_command_id = (2 + len(clientinit_packets)) & 0xFFFF
 
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -1187,7 +1188,7 @@ class TS3Client:
             if name == "initserver":
                 if "aclid" in args:
                     self.client_id = int(args["aclid"])
-                self.command_id = max(self.command_id, 3)
+                self.command_id = next_command_id
                 self.connected = True
                 print("[+] Connected")
                 return True
@@ -1242,7 +1243,9 @@ class TS3Client:
         ]
         print(f"[*] Spiele Link: {link}")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.play_process = proc
         next_frame = time.monotonic()
+        interrupted = False
         try:
             while True:
                 chunk = proc.stdout.read(OPUS_MUSIC_FRAME_BYTES)
@@ -1263,14 +1266,30 @@ class TS3Client:
                 delay = next_frame - time.monotonic()
                 if delay > 0:
                     time.sleep(delay)
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
         finally:
-            if proc.poll() is None:
-                proc.terminate()
+            self.stop_playback_process()
             stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
-            rc = proc.wait(timeout=2)
-            if rc != 0:
+            rc = proc.returncode if proc.returncode is not None else proc.wait(timeout=2)
+            self.play_process = None
+            if rc != 0 and not interrupted:
                 raise RuntimeError(f"ffmpeg konnte den Link nicht abspielen: {stderr or 'exit ' + str(rc)}")
         print("[*] Wiedergabe beendet.")
+
+    def stop_playback_process(self):
+        proc = self.play_process
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
 
     def drain_initial_audio_state(self):
         deadline = time.time() + 2
@@ -1283,28 +1302,94 @@ class TS3Client:
 
     def disconnect(self):
         try:
+            self.stop_playback_process()
             if self.iv is not None and self.connected:
+                self.drain_before_disconnect()
                 cmd = make_command("clientdisconnect", [
                     ("reasonid", "8"),
                     ("reasonmsg", "Python Client say's good bye!"),
                 ])
-                self.send_command(cmd)
+                disconnect_packet_id = self.command_id
+                self.command_id = (self.command_id + 1) & 0xFFFF
                 deadline = time.time() + 5
+                last_send = 0.0
+                got_ack = False
                 while time.time() < deadline:
+                    now = time.time()
+                    if now - last_send >= 0.5 and not got_ack:
+                        if self.verbose:
+                            print(f"[DISCONNECT] send packet_id={disconnect_packet_id}")
+                        self.send(encrypt_shared(
+                            cmd,
+                            disconnect_packet_id,
+                            self.client_id,
+                            PTYPE_COMMAND,
+                            self.iv,
+                            FLAG_NEWPROTOCOL,
+                        ))
+                        last_send = now
                     try:
-                        _, name, args, text = self.recv_command(timeout=0.5)
+                        raw = self.recv_raw(timeout=0.2)
                     except socket.timeout:
                         continue
+                    except KeyboardInterrupt:
+                        continue
 
+                    packet = parse_s2c(raw)
+                    if packet.ptype == PTYPE_ACK:
+                        try:
+                            ack_payload = decrypt_shared(packet, raw, self.iv)
+                            if len(ack_payload) >= 2 and struct.unpack(">H", ack_payload[:2])[0] == disconnect_packet_id:
+                                got_ack = True
+                                if self.verbose:
+                                    print(f"[DISCONNECT] ACK packet_id={disconnect_packet_id}")
+                        except Exception:
+                            pass
+                        continue
+                    if packet.ptype == PTYPE_PING:
+                        self.send_pong(packet.packet_id)
+                        continue
+                    if packet.ptype == PTYPE_PONG:
+                        continue
+                    if packet.ptype != PTYPE_COMMAND:
+                        continue
+
+                    result = self.decode_command_packet(raw, packet)
+                    if result is None:
+                        continue
+                    _, name, args, text = result
                     if name == "notifyclientleftview" and args.get("clid") == str(self.client_id):
                         if self.verbose:
                             print(f"[DISCONNECT] {text}")
                         self.connected = False
                         break
                     self.handle_event(name, args, text)
+                if self.verbose and self.connected:
+                    print(f"[DISCONNECT] timeout ack={got_ack}")
         except Exception:
+            if self.verbose:
+                print("[DISCONNECT] failed")
             pass
         self.sock.close()
+
+    def drain_before_disconnect(self):
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            try:
+                raw = self.recv_raw(timeout=0.05)
+            except (socket.timeout, BlockingIOError, KeyboardInterrupt):
+                return
+            try:
+                packet = parse_s2c(raw)
+                if packet.ptype == PTYPE_PING:
+                    self.send_pong(packet.packet_id)
+                elif packet.ptype == PTYPE_COMMAND:
+                    result = self.decode_command_packet(raw, packet)
+                    if result is not None:
+                        _, name, args, text = result
+                        self.handle_event(name, args, text)
+            except Exception:
+                continue
 
 
 def main():
@@ -1367,14 +1452,20 @@ def main():
         else:
             client.listen()
     except KeyboardInterrupt:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         print("\n[*] Unterbrochen, sende Disconnect.")
     except Exception as e:
         print(f"[-] {e}")
         return 1
     finally:
         if client is not None:
-            client.disconnect()
-            print("[*] Getrennt.")
+            old_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                client.disconnect()
+                print("[*] Getrennt.")
+            finally:
+                signal.signal(signal.SIGINT, old_sigint)
     return 0
 
 
